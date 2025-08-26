@@ -104,3 +104,19 @@ jobs:
           files: ${{ env.EXE_PATH }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    - name: Publish timestamped release (push on main)
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $sha = $env:GITHUB_SHA.Substring(0,7)
+          $ts = (Get-Date).ToUniversalTime().ToString('yyyyMMddHHmm')
+          $tag = $ts
+          # Ensure uniqueness if multiple builds in same minute
+          $check = gh release view $tag 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            $tag = "$ts-$env:GITHUB_RUN_NUMBER"
+          }
+            
+          Write-Host "Creating release tag: $tag"
+      gh release create $tag $env:EXE_PATH --title "Build $tag" --notes "Automated build for commit $sha (run #$env:GITHUB_RUN_NUMBER)" --latest
