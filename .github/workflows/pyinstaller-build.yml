@@ -4,12 +4,19 @@ on:
   push:
     branches: [ main ]
     paths:
-      - '**.py'
+      - 'main.py'
+      - 'gui.py'
       - '1fichier_gui.spec'
       - 'requirements.txt'
       - '.github/workflows/pyinstaller-build.yml'
   pull_request:
     branches: [ main ]
+    paths:
+      - 'main.py'
+      - 'gui.py'
+      - '1fichier_gui.spec'
+      - 'requirements.txt'
+      - '.github/workflows/pyinstaller-build.yml'
   workflow_dispatch:
     inputs:
       python-version:
