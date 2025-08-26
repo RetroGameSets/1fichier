@@ -23,6 +23,7 @@ exe = EXE(
     a.datas,
     [],
     name='1fichier_gui',
+    icon='icon.ico',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
