@@ -23,6 +23,8 @@ on:
 
 jobs:
   build-windows:
+    permissions:
+      contents: write  # needed to create releases
     runs-on: windows-latest
     defaults:
       run:
@@ -116,4 +118,11 @@ jobs:
           gh release view $tag 2>$null
           if ($LASTEXITCODE -eq 0) { $tag = "$ts-$env:GITHUB_RUN_NUMBER" }
           Write-Host "Creating release tag: $tag"
-          gh release create $tag $env:EXE_PATH --title "Build $tag" --notes "Automated build for commit $sha (run #$env:GITHUB_RUN_NUMBER)" --latest
+          try {
+            gh release create $tag $env:EXE_PATH --title "Build $tag" --notes "Automated build for commit $sha (run #$env:GITHUB_RUN_NUMBER)" --latest
+          }
+          catch {
+            Write-Warning "Release creation failed: $($_.Exception.Message)";
+            Write-Warning 'Check: repository settings > Actions > Workflow permissions (must allow Read and write).';
+            exit 0  # do not fail whole build
+          }
