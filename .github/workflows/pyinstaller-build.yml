@@ -75,25 +75,26 @@ jobs:
       - name: Locate exe
         id: locate
         run: |
-          $folder = Get-ChildItem dist | Where-Object { $_.PsIsContainer } | Select-Object -First 1 -ExpandProperty Name
-          if (-not $folder) { Write-Error 'No dist folder found' }
-          $exe = Join-Path dist "$folder/${{ env.DIST_NAME }}.exe"
-          if (-not (Test-Path $exe)) { Write-Error "Executable not found at $exe" }
+          if (-not (Test-Path dist)) { Write-Error 'dist folder not created' }
+          $exe = Get-ChildItem dist -Filter "${{ env.DIST_NAME }}.exe" -File -Recurse | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $exe) {
+            # Maybe one-folder mode: look for subfolder then exe inside
+            $folder = Get-ChildItem dist | Where-Object { $_.PsIsContainer } | Select-Object -First 1 -ExpandProperty FullName
+            if ($folder) {
+              $attempt = Join-Path $folder "${{ env.DIST_NAME }}.exe"
+              if (Test-Path $attempt) { $exe = $attempt }
+            }
+          }
+          if (-not $exe) { Write-Error 'Executable not found after build.' }
           echo "EXE_PATH=$exe" >> $env:GITHUB_ENV
           Write-Host "Found EXE: $exe"
 
       - name: Upload executable artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.DIST_NAME }}-exe-win64
-          path: ${{ env.DIST_NAME }}.spec
-          if-no-files-found: warn
-      - name: Upload exe real
-        uses: actions/upload-artifact@v4
-        with:
-            name: ${{ env.DIST_NAME }}-raw-exe
-            path: ${{ env.EXE_PATH }}
-            if-no-files-found: error
+          name: ${{ env.DIST_NAME }}-win64-exe
+          path: ${{ env.EXE_PATH }}
+          if-no-files-found: error
 
       - name: (Optional) Draft release on tag
         if: startsWith(github.ref, 'refs/tags/')
