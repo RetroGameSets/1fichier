@@ -24,6 +24,9 @@ import threading
 import queue
 import os
 import io
+import json
+import base64
+import time
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import main as core  # le fichier main.py existant
@@ -36,6 +39,13 @@ TEXT = {
         'output_dir': "Dossier de sortie:",
         'browse': "Parcourir",
         'urls_box': "URLs (une par ligne)",
+        'api_key_label': "Clé API Premium:",
+        'api_key_placeholder': "Optionnel: votre clé API 1fichier pour téléchargements premium",
+        'api_key_save': "Sauvegarder",
+        'api_key_clear': "Effacer",
+        'api_key_saved': "Clé API sauvegardée",
+        'api_key_cleared': "Clé API effacée",
+        'api_key_load_error': "Erreur chargement clé API:",
         'add': "Ajouter",
         'start': "Démarrer",
         'pause': "Pause",
@@ -43,6 +53,8 @@ TEXT = {
         'stop': "Stop",
         'files': "Fichiers",
         'logs': "Logs",
+        'speed': "Vitesse",
+        'eta': "Temps restant",
         'info_add_disabled': "Ajout désactivé pendant un téléchargement en cours.",
         'warn_no_url': "Aucune URL à ajouter.",
         'err_create_dir': "Impossible de créer le dossier:",
@@ -70,6 +82,13 @@ TEXT = {
         'output_dir': "Output folder:",
         'browse': "Browse",
         'urls_box': "URLs (one per line)",
+        'api_key_label': "Premium API Key:",
+        'api_key_placeholder': "Optional: your 1fichier API key for premium downloads",
+        'api_key_save': "Save",
+        'api_key_clear': "Clear",
+        'api_key_saved': "API key saved",
+        'api_key_cleared': "API key cleared",
+        'api_key_load_error': "API key loading error:",
         'add': "Add",
         'start': "Start",
         'pause': "Pause",
@@ -77,6 +96,8 @@ TEXT = {
         'stop': "Stop",
         'files': "Files",
         'logs': "Logs",
+        'speed': "Speed",
+        'eta': "ETA",
         'info_add_disabled': "Add disabled while a download is running.",
         'warn_no_url': "No URL to add.",
         'err_create_dir': "Cannot create directory:",
@@ -135,8 +156,15 @@ class DownloaderGUI:
         self.current_url = None
         self.wait_remaining = {}
         self.wait_countdown_threads = set()
+        
+        # Configuration file path
+        self.config_file = os.path.join(os.path.expanduser("~"), ".1fichier_config.json")
+        
         # Widgets (peut appeler _update_total_progress_label qui dépend maintenant des attributs ci‑dessus)
         self._build_widgets()
+        
+        # Charger la clé API sauvegardée
+        self._load_api_key()
         # Lancement polling logs
         self.root.after(150, self._poll_log_queue)
         # Prépare motifs de traduction logs FR->EN
@@ -148,6 +176,12 @@ class DownloaderGUI:
             (re.compile(r'^⏳ Attente (.+)$'), '⏳ Waiting \\1'),
             (re.compile(r'^✅ Terminé → (.+)$'), '✅ Done → \\1'),
             (re.compile(r'^✅ Terminé → (.+) \(sans attente\)$'), '✅ Done → \\1 (no wait)'),
+            (re.compile(r'^🔑 Tentative téléchargement premium via API \(ID: (.+)\)$'), '🔑 Attempting premium download via API (ID: \\1)'),
+            (re.compile(r'^📄 Nom via API: (.+)$'), '📄 Name via API: \\1'),
+            (re.compile(r'^⬇️ Téléchargement premium → (.+)$'), '⬇️ Premium downloading → \\1'),
+            (re.compile(r'^✅ Téléchargement premium terminé → (.+)$'), '✅ Premium download completed → \\1'),
+            (re.compile(r'^⚠️ Échec téléchargement premium, passage en mode gratuit\.\.\.$'), '⚠️ Premium download failed, switching to free mode...'),
+            (re.compile(r'^⚠️ Erreur API premium: (.+), passage en mode gratuit\.\.\.$'), '⚠️ Premium API error: \\1, switching to free mode...'),
             (re.compile(r'^❌ Page reçue indique indisponibilité / conditions\. \(Fichier supprimé ou limites atteintes\.\)$'), '❌ Page indicates unavailability / conditions (File removed or limits reached).'),
             (re.compile(r'^⚠️ Captcha détecté\. Résolution manuelle requise.*$'), '⚠️ Captcha detected. Manual resolution required (open in browser, solve, then reuse cookie/token).'),
             (re.compile(r'^⚠️ Captcha détecté après soumission\. Abandon\.$'), '⚠️ Captcha detected after submission. Aborting.'),
@@ -184,6 +218,27 @@ class DownloaderGUI:
         self.lang_select.pack(side=tk.RIGHT)
         self.lang_select.bind('<<ComboboxSelected>>', self.on_language_change)
 
+        # Clé API Premium avec boutons de sauvegarde
+        frm_api = ttk.Frame(self.root)
+        frm_api.pack(fill=tk.X, padx=8, pady=2)
+        self.lbl_api_key = ttk.Label(frm_api, text=TEXT[self.lang]['api_key_label'])
+        self.lbl_api_key.pack(side=tk.LEFT)
+        self.api_key_var = tk.StringVar(value="")
+        self.api_key_entry = ttk.Entry(frm_api, textvariable=self.api_key_var, width=50, show="*")
+        self.api_key_entry.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+        
+        # Boutons de gestion de la clé API
+        self.api_save_btn = ttk.Button(frm_api, text=TEXT[self.lang]['api_key_save'], command=self._save_api_key)
+        self.api_save_btn.pack(side=tk.LEFT, padx=2)
+        self.api_clear_btn = ttk.Button(frm_api, text=TEXT[self.lang]['api_key_clear'], command=self._clear_api_key)
+        self.api_clear_btn.pack(side=tk.LEFT, padx=2)
+        
+        # Tooltip/placeholder pour la clé API
+        self.api_key_entry.bind("<FocusIn>", self._on_api_key_focus_in)
+        self.api_key_entry.bind("<FocusOut>", self._on_api_key_focus_out)
+        self._api_key_placeholder_active = False
+        self._set_api_key_placeholder()
+
         # Zone URLs
         self.frm_urls = ttk.LabelFrame(self.root, text=TEXT[self.lang]['urls_box'])
         self.frm_urls.pack(fill=tk.BOTH, expand=False, padx=8, pady=5)
@@ -210,34 +265,209 @@ class DownloaderGUI:
         # Tableau fichiers
         self.frm_table = ttk.LabelFrame(self.root, text=TEXT[self.lang]['files'])
         self.frm_table.pack(fill=tk.BOTH, expand=True, padx=8, pady=5)
-        columns = ("display", "status", "progress", "url")
+        columns = ("display", "status", "progress", "speed", "eta", "url")
         self.tree = ttk.Treeview(self.frm_table, columns=columns, show="headings")
         headers = [
             "Nom" if self.lang=='fr' else 'Name',
             "Statut" if self.lang=='fr' else 'Status',
             "Progression" if self.lang=='fr' else 'Progress',
+            "Vitesse" if self.lang=='fr' else 'Speed',
+            "Temps restant" if self.lang=='fr' else 'ETA',
             "URL"
         ]
         for col, txt in zip(columns, headers):
             self.tree.heading(col, text=txt)
-            base_w = 260 if col in ("display", "url") else 120
+            if col == "display":
+                base_w = 200
+            elif col == "url":
+                base_w = 200
+            elif col in ("speed", "eta"):
+                base_w = 100
+            else:
+                base_w = 120
             self.tree.column(col, anchor=tk.W, stretch=True, width=base_w)
         self.tree.pack(fill=tk.BOTH, expand=True)
+        
+        # Menu contextuel pour le tableau
+        self.tree_context_menu = tk.Menu(self.root, tearoff=0)
+        self._setup_tree_context_menu()
+        self.tree.bind("<Button-3>", self._show_tree_context_menu)
 
-        # Logs
+        # Logs avec ascenseur
         self.frm_log = ttk.LabelFrame(self.root, text=TEXT[self.lang]['logs'])
         self.frm_log.pack(fill=tk.BOTH, expand=True, padx=8, pady=5)
-        self.log_text = tk.Text(self.frm_log, height=10, wrap="word")
-        self.log_text.pack(fill=tk.BOTH, expand=True)
+        
+        # Frame pour le Text et la Scrollbar
+        log_frame = ttk.Frame(self.frm_log)
+        log_frame.pack(fill=tk.BOTH, expand=True)
+        
+        self.log_text = tk.Text(log_frame, height=10, wrap="word")
+        log_scrollbar = ttk.Scrollbar(log_frame, orient=tk.VERTICAL, command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=log_scrollbar.set)
+        
+        self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        log_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.log_text.configure(state=tk.DISABLED)
+        
+        # Menu contextuel pour les logs
+        self.log_context_menu = tk.Menu(self.root, tearoff=0)
+        self._setup_log_context_menu()
+        self.log_text.bind("<Button-3>", self._show_log_context_menu)
+        
         # Init libellé progression globale
         self._update_total_progress_label()
+
+    def _set_api_key_placeholder(self):
+        """Affiche le placeholder dans le champ API key s'il est vide."""
+        if not self.api_key_var.get():
+            self._api_key_placeholder_active = True
+            self.api_key_entry.config(show="")
+            self.api_key_entry.config(foreground="gray")
+            self.api_key_var.set(TEXT[self.lang]['api_key_placeholder'])
+
+    def _clear_api_key_placeholder(self):
+        """Supprime le placeholder du champ API key."""
+        if self._api_key_placeholder_active:
+            self._api_key_placeholder_active = False
+            self.api_key_entry.config(show="*")
+            self.api_key_entry.config(foreground="black")
+            self.api_key_var.set("")
+
+    def _on_api_key_focus_in(self, event):
+        """Événement quand le champ API key prend le focus."""
+        self._clear_api_key_placeholder()
+
+    def _on_api_key_focus_out(self, event):
+        """Événement quand le champ API key perd le focus."""
+        if not self.api_key_var.get():
+            self._set_api_key_placeholder()
+
+    def get_api_key(self) -> str | None:
+        """Retourne la clé API saisie ou None si placeholder/vide."""
+        if self._api_key_placeholder_active:
+            return None
+        key = self.api_key_var.get().strip()
+        return key if key else None
+
+    def _setup_log_context_menu(self):
+        """Configure le menu contextuel pour les logs."""
+        # Supprimer tous les éléments existants
+        self.log_context_menu.delete(0, tk.END)
+        
+        # Ajouter les options selon la langue
+        if self.lang == 'fr':
+            self.log_context_menu.add_command(label="Copier tout", command=self._copy_all_logs)
+            self.log_context_menu.add_command(label="Copier sélection", command=self._copy_selected_logs)
+            self.log_context_menu.add_separator()
+            self.log_context_menu.add_command(label="Effacer logs", command=self._clear_logs)
+        else:
+            self.log_context_menu.add_command(label="Copy all", command=self._copy_all_logs)
+            self.log_context_menu.add_command(label="Copy selection", command=self._copy_selected_logs)
+            self.log_context_menu.add_separator()
+            self.log_context_menu.add_command(label="Clear logs", command=self._clear_logs)
+
+    def _show_log_context_menu(self, event):
+        """Affiche le menu contextuel des logs."""
+        try:
+            self.log_context_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.log_context_menu.grab_release()
+
+    def _copy_all_logs(self):
+        """Copie tout le contenu des logs dans le presse-papiers."""
+        self.root.clipboard_clear()
+        self.root.clipboard_append(self.log_text.get("1.0", tk.END))
+
+    def _copy_selected_logs(self):
+        """Copie la sélection des logs dans le presse-papiers."""
+        try:
+            selected_text = self.log_text.get(tk.SEL_FIRST, tk.SEL_LAST)
+            self.root.clipboard_clear()
+            self.root.clipboard_append(selected_text)
+        except tk.TclError:
+            # Aucune sélection
+            pass
+
+    def _clear_logs(self):
+        """Efface tous les logs."""
+        self.log_text.configure(state=tk.NORMAL)
+        self.log_text.delete("1.0", tk.END)
+        self.log_text.configure(state=tk.DISABLED)
+
+    def _setup_tree_context_menu(self):
+        """Configure le menu contextuel pour le tableau des fichiers."""
+        # Supprimer tous les éléments existants
+        self.tree_context_menu.delete(0, tk.END)
+        
+        # Ajouter les options selon la langue
+        if self.lang == 'fr':
+            self.tree_context_menu.add_command(label="Copier URL", command=self._copy_tree_url)
+            self.tree_context_menu.add_command(label="Copier nom fichier", command=self._copy_tree_filename)
+            self.tree_context_menu.add_command(label="Copier ligne complète", command=self._copy_tree_full_line)
+        else:
+            self.tree_context_menu.add_command(label="Copy URL", command=self._copy_tree_url)
+            self.tree_context_menu.add_command(label="Copy filename", command=self._copy_tree_filename)
+            self.tree_context_menu.add_command(label="Copy full line", command=self._copy_tree_full_line)
+
+    def _show_tree_context_menu(self, event):
+        """Affiche le menu contextuel du tableau."""
+        # Sélectionner l'item sous la souris
+        item = self.tree.identify_row(event.y)
+        if item:
+            self.tree.selection_set(item)
+            try:
+                self.tree_context_menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                self.tree_context_menu.grab_release()
+
+    def _copy_tree_url(self):
+        """Copie l'URL de l'élément sélectionné."""
+        selection = self.tree.selection()
+        if selection:
+            item = selection[0]
+            url = self.tree.item(item, 'values')[5]  # La colonne URL est à l'index 5
+            self.root.clipboard_clear()
+            self.root.clipboard_append(url)
+
+    def _copy_tree_filename(self):
+        """Copie le nom du fichier de l'élément sélectionné."""
+        selection = self.tree.selection()
+        if selection:
+            item = selection[0]
+            filename = self.tree.item(item, 'values')[0]  # La colonne nom est à l'index 0
+            self.root.clipboard_clear()
+            self.root.clipboard_append(filename)
+
+    def _copy_tree_full_line(self):
+        """Copie toute la ligne de l'élément sélectionné."""
+        selection = self.tree.selection()
+        if selection:
+            item = selection[0]
+            values = self.tree.item(item, 'values')
+            headers = [
+                "Nom" if self.lang=='fr' else 'Name',
+                "Statut" if self.lang=='fr' else 'Status',
+                "Progression" if self.lang=='fr' else 'Progress',
+                "Vitesse" if self.lang=='fr' else 'Speed',
+                "Temps restant" if self.lang=='fr' else 'ETA',
+                "URL"
+            ]
+            # Créer une ligne formatée avec les en-têtes
+            line_parts = []
+            for header, value in zip(headers, values):
+                line_parts.append(f"{header}: {value}")
+            full_line = " | ".join(line_parts)
+            self.root.clipboard_clear()
+            self.root.clipboard_append(full_line)
 
     def _apply_language_update(self):
         """Applique les textes correspondant à la langue courante (self.lang)."""
         self.root.title(TEXT[self.lang]['title'])
         self.lbl_outdir.config(text=TEXT[self.lang]['output_dir'])
         self.btn_browse.config(text=TEXT[self.lang]['browse'])
+        self.lbl_api_key.config(text=TEXT[self.lang]['api_key_label'])
+        self.api_save_btn.config(text=TEXT[self.lang]['api_key_save'])
+        self.api_clear_btn.config(text=TEXT[self.lang]['api_key_clear'])
         self.frm_urls.config(text=TEXT[self.lang]['urls_box'])
         self.add_btn.config(text=TEXT[self.lang]['add'])
         self.start_btn.config(text=TEXT[self.lang]['start'])
@@ -245,6 +475,13 @@ class DownloaderGUI:
         self.stop_btn.config(text=TEXT[self.lang]['stop'])
         self.frm_table.config(text=TEXT[self.lang]['files'])
         self.frm_log.config(text=TEXT[self.lang]['logs'])
+        # Mise à jour du menu contextuel des logs
+        self._setup_log_context_menu()
+        # Mise à jour du menu contextuel du tableau
+        self._setup_tree_context_menu()
+        # Mise à jour du placeholder API key
+        if self._api_key_placeholder_active:
+            self.api_key_var.set(TEXT[self.lang]['api_key_placeholder'])
         # Libellé progression globale
         self._update_total_progress_label()
         # En-têtes tableau
@@ -252,9 +489,11 @@ class DownloaderGUI:
             "Nom" if self.lang=='fr' else 'Name',
             "Statut" if self.lang=='fr' else 'Status',
             "Progression" if self.lang=='fr' else 'Progress',
+            "Vitesse" if self.lang=='fr' else 'Speed',
+            "Temps restant" if self.lang=='fr' else 'ETA',
             "URL"
         ]
-        for col, txt in zip(("display","status","progress","url"), headers):
+        for col, txt in zip(("display","status","progress","speed","eta","url"), headers):
             self.tree.heading(col, text=txt)
         # Traduction statuts existants
         map_fr_en = {
@@ -452,8 +691,8 @@ class DownloaderGUI:
             if u in self.urls_in_progress:
                 continue
             initial_status = TEXT[self.lang]['status_waiting']
-            iid = self.tree.insert('', tk.END, values=('', initial_status, '0%', u))
-            self.urls_in_progress[u] = {'iid': iid, 'status': initial_status, 'pct': 0.0, 'display': '', 'url': u}
+            iid = self.tree.insert('', tk.END, values=('', initial_status, '0%', '', '', u))
+            self.urls_in_progress[u] = {'iid': iid, 'status': initial_status, 'pct': 0.0, 'display': '', 'url': u, 'speed': '', 'eta': ''}
             self.queued_order.append(u)
             new_urls.append(u)
         # Efface la zone texte après ajout
@@ -630,6 +869,7 @@ class DownloaderGUI:
                         progress_cb=self._progress_callback,
                         wait_cb=self._wait_callback,
                         pause_event=self.pause_event,
+                        api_key=self.get_api_key(),
                     )
                 except Exception as e:
                     LOG_QUEUE.put(f"\n❌ {TEXT[self.lang]['status_error']} {url}: {e}\n")
@@ -641,13 +881,65 @@ class DownloaderGUI:
         """Callback progression (depuis core.download_file).
 
         Re-synchronisé vers le thread principal via root.after.
-        Met à jour: pourcentage individuel + statut + progression globale.
+        Met à jour: pourcentage individuel + statut + progression globale + vitesse + ETA.
         """
         # Exécuter modifications UI dans le thread principal
         def _apply():
             data = self.urls_in_progress.get(url)
             if not data:
                 return
+            
+            current_time = time.time()
+            
+            # Initialiser le temps de début si nécessaire
+            if 'start_time' not in data:
+                data['start_time'] = current_time
+                data['last_update'] = current_time
+                data['last_downloaded'] = downloaded
+            
+            # Calculer la vitesse (octets par seconde)
+            time_diff = current_time - data.get('last_update', current_time)
+            if time_diff > 0.5:  # Mettre à jour la vitesse toutes les 0.5 secondes
+                bytes_diff = downloaded - data.get('last_downloaded', 0)
+                speed_bps = bytes_diff / time_diff if time_diff > 0 else 0
+                
+                # Formater la vitesse
+                if speed_bps < 1024:
+                    speed_str = f"{speed_bps:.0f} B/s"
+                elif speed_bps < 1024*1024:
+                    speed_str = f"{speed_bps/1024:.1f} KB/s"
+                elif speed_bps < 1024*1024*1024:
+                    speed_str = f"{speed_bps/(1024*1024):.1f} MB/s"
+                else:
+                    speed_str = f"{speed_bps/(1024*1024*1024):.1f} GB/s"
+                
+                data['speed'] = speed_str
+                data['last_update'] = current_time
+                data['last_downloaded'] = downloaded
+                
+                # Calculer l'ETA
+                if total and speed_bps > 0:
+                    remaining_bytes = total - downloaded
+                    eta_seconds = remaining_bytes / speed_bps
+                    
+                    if eta_seconds < 60:
+                        eta_str = f"{eta_seconds:.0f}s"
+                    elif eta_seconds < 3600:
+                        minutes = int(eta_seconds // 60)
+                        seconds = int(eta_seconds % 60)
+                        eta_str = f"{minutes}m{seconds:02d}s"
+                    else:
+                        hours = int(eta_seconds // 3600)
+                        minutes = int((eta_seconds % 3600) // 60)
+                        eta_str = f"{hours}h{minutes:02d}m"
+                    data['eta'] = eta_str
+                else:
+                    data['eta'] = '--'
+                
+                # Mettre à jour l'affichage
+                self.tree.set(data['iid'], 'speed', data['speed'])
+                self.tree.set(data['iid'], 'eta', data['eta'])
+            
             if percent is not None:
                 data['pct'] = percent
                 self.tree.set(data['iid'], 'progress', f"{percent:.1f}%")
@@ -655,9 +947,15 @@ class DownloaderGUI:
                 if data['status'] == TEXT[self.lang]['status_paused'] and (not self.pause_event or self.pause_event.is_set()):
                     data['status'] = TEXT[self.lang]['status_running']
                     self.tree.set(data['iid'], 'status', data['status'])
+            
             if percent == 100 or (total and downloaded >= total):
                 data['status'] = TEXT[self.lang]['status_done']
+                data['speed'] = '--'
+                data['eta'] = '--'
                 self.tree.set(data['iid'], 'status', data['status'])
+                self.tree.set(data['iid'], 'speed', data['speed'])
+                self.tree.set(data['iid'], 'eta', data['eta'])
+            
             self._recompute_global_progress()
         try:
             self.root.after(0, _apply)
@@ -761,6 +1059,83 @@ class DownloaderGUI:
                         self.tree.set(data['iid'], 'status', data['status'])
                         self.start_btn.configure(state=tk.NORMAL)
                         self.stop_btn.configure(state=tk.DISABLED)
+
+    def _save_api_key(self):
+        """Sauvegarde la clé API dans un fichier de configuration."""
+        api_key = self.get_api_key()
+        if not api_key:
+            messagebox.showwarning("Attention", "Aucune clé API à sauvegarder")
+            return
+        
+        try:
+            # Chiffrement simple (base64) pour éviter le stockage en clair
+            encoded_key = base64.b64encode(api_key.encode('utf-8')).decode('utf-8')
+            
+            config = {}
+            if os.path.exists(self.config_file):
+                try:
+                    with open(self.config_file, 'r', encoding='utf-8') as f:
+                        config = json.load(f)
+                except:
+                    config = {}
+            
+            config['api_key'] = encoded_key
+            
+            with open(self.config_file, 'w', encoding='utf-8') as f:
+                json.dump(config, f, indent=2)
+            
+            messagebox.showinfo("Succès", TEXT[self.lang]['api_key_saved'])
+            
+        except Exception as e:
+            messagebox.showerror("Erreur", f"{TEXT[self.lang]['api_key_load_error']} {e}")
+
+    def _clear_api_key(self):
+        """Efface la clé API sauvegardée."""
+        try:
+            if os.path.exists(self.config_file):
+                with open(self.config_file, 'r', encoding='utf-8') as f:
+                    config = json.load(f)
+                
+                if 'api_key' in config:
+                    del config['api_key']
+                    
+                    with open(self.config_file, 'w', encoding='utf-8') as f:
+                        json.dump(config, f, indent=2)
+            
+            # Effacer le champ
+            self.api_key_var.set("")
+            self._set_api_key_placeholder()
+            
+            messagebox.showinfo("Succès", TEXT[self.lang]['api_key_cleared'])
+            
+        except Exception as e:
+            messagebox.showerror("Erreur", f"{TEXT[self.lang]['api_key_load_error']} {e}")
+
+    def _load_api_key(self):
+        """Charge la clé API depuis le fichier de configuration."""
+        try:
+            if not os.path.exists(self.config_file):
+                return
+            
+            with open(self.config_file, 'r', encoding='utf-8') as f:
+                config = json.load(f)
+            
+            encoded_key = config.get('api_key')
+            if encoded_key:
+                try:
+                    # Déchiffrement
+                    api_key = base64.b64decode(encoded_key.encode('utf-8')).decode('utf-8')
+                    self.api_key_var.set(api_key)
+                    self._api_key_placeholder_active = False
+                    self.api_key_entry.config(show="*")
+                    self.api_key_entry.config(foreground="black")
+                except:
+                    # Si le déchiffrement échoue, ignorer silencieusement
+                    pass
+                    
+        except Exception:
+            # Ignorer les erreurs de chargement silencieusement
+            pass
 
 
 def launch_gui():

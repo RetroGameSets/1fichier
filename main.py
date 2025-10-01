@@ -7,7 +7,7 @@ import sys
 import traceback
 import httpx #type:ignore
 from bs4 import BeautifulSoup #type:ignore
-from urllib.parse import unquote, urljoin
+from urllib.parse import unquote, urljoin, urlparse
 
 WAIT_REGEXES = [
     r"(?:veuillez\s+)?patiente[rz]\s*(\d+)\s*(?:sec|secondes?|s)\b",
@@ -239,9 +239,148 @@ def save_debug(debug, label, content):
     except Exception as e:
         print(f"[debug] Échec sauvegarde {label}: {e}")
 
-async def download_file(client, url, outdir=".", debug=False, force_wait=False, save_html=False, log_cb=None, progress_cb=None, wait_cb=None, pause_event: asyncio.Event | None = None):
+async def download_via_api(client: httpx.AsyncClient, url: str, api_key: str, outdir: str = ".", log_cb=None, progress_cb=None) -> bool:
+    """Tente un téléchargement via l'API premium 1fichier.
+    
+    Retourne True si succès, False si échec (fallback vers mode gratuit).
+    """
+    def _log(msg: str):
+        if log_cb:
+            try:
+                log_cb(msg)
+            except Exception:
+                print(msg)
+        else:
+            print(msg)
+    
+    def _progress(filename, downloaded, total):
+        if progress_cb:
+            pct = (downloaded / total * 100) if total else None
+            try:
+                progress_cb(url, filename, downloaded, total, pct)
+            except Exception:
+                pass
+    
+    _log(f"🔑 Tentative téléchargement premium via API")
+    
+    # Headers d'authentification
+    auth_headers = {
+        'Authorization': f'Bearer {api_key}',
+        'Content-Type': 'application/json'
+    }
+    
+    # Étape 1: Obtenir les infos du fichier
+    try:
+        info_resp = await client.post(
+            "https://api.1fichier.com/v1/file/info.cgi",
+            json={'url': url},
+            headers=auth_headers
+        )
+        info_resp.raise_for_status()
+        info_data = info_resp.json()
+        
+        # Si la réponse contient directement les infos du fichier (pas de status/message)
+        if 'filename' in info_data and 'size' in info_data:
+            filename = info_data.get('filename', 'unknown_file')
+            file_size = int(info_data.get('size', 0))
+        elif info_data.get('status') == 'OK':
+            filename = info_data.get('filename', 'unknown_file')
+            file_size = int(info_data.get('size', 0))
+        else:
+            error_msg = info_data.get('message', 'Unknown error')
+            _log(f"❌ API info error: {error_msg}")
+            if 'authenticated' in error_msg.lower():
+                _log("💡 Vérifiez que votre clé API est valide et que vous avez un compte premium")
+            return False
+        
+        _log(f"📄 Nom via API: {filename} ({file_size/1024/1024:.2f} MB)")
+        
+    except httpx.HTTPStatusError as e:
+        _log(f"❌ Erreur HTTP lors de la récupération des infos: {e.response.status_code} - {e.response.text}")
+        return False
+    except Exception as e:
+        _log(f"❌ Erreur récupération infos API: {e}")
+        return False
+    
+    # Étape 2: Obtenir le lien de téléchargement
+    try:
+        dl_resp = await client.post(
+            "https://api.1fichier.com/v1/download/get_token.cgi", 
+            json={'url': url},
+            headers=auth_headers
+        )
+        dl_resp.raise_for_status()
+        dl_data = dl_resp.json()
+        
+        # L'API peut retourner directement l'URL ou avec un status
+        if 'url' in dl_data:
+            download_url = dl_data.get('url')
+        elif dl_data.get('status') == 'OK':
+            download_url = dl_data.get('url')
+        else:
+            error_msg = dl_data.get('message', 'Unknown error')
+            _log(f"❌ API download error: {error_msg}")
+            if 'limit' in error_msg.lower():
+                _log("💡 Limite de téléchargement premium atteinte")
+            return False
+        
+        if not download_url:
+            _log("❌ Aucun lien de téléchargement reçu de l'API")
+            return False
+        
+    except httpx.HTTPStatusError as e:
+        _log(f"❌ Erreur HTTP lors de l'obtention du lien: {e.response.status_code} - {e.response.text}")
+        return False
+    except Exception as e:
+        _log(f"❌ Erreur obtention lien API: {e}")
+        return False
+    
+    # Étape 3: Téléchargement du fichier
+    try:
+        final_path = os.path.join(outdir, filename)
+        part_path = final_path + ".part"
+        
+        # Vérification reprise
+        existing = os.path.getsize(part_path) if os.path.exists(part_path) else 0
+        headers = {}
+        mode = "wb"
+        
+        if existing > 0:
+            headers["Range"] = f"bytes={existing}-"
+            mode = "ab"
+            _log(f"▶️ Reprise à {existing/1024/1024:.2f} MB")
+        
+        _log(f"⬇️ Téléchargement premium → {filename}")
+        
+        # Variables pour calcul de vitesse
+        start_time = time.time()
+        
+        async with client.stream("GET", download_url, headers=headers) as resp:
+            resp.raise_for_status()
+            total = int(resp.headers.get("content-length", 0)) + existing if file_size else None
+            downloaded = existing
+            
+            with open(part_path, mode) as f:
+                async for chunk in resp.aiter_bytes(1024*128):
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    _progress(filename, downloaded, total)
+        
+        os.replace(part_path, final_path)
+        _log(f"✅ Téléchargement premium terminé → {final_path}")
+        _progress(filename, file_size or os.path.getsize(final_path), file_size or os.path.getsize(final_path))
+        return True
+        
+    except Exception as e:
+        _log(f"❌ Erreur téléchargement API: {e}")
+        return False
+
+async def download_file(client, url, outdir=".", debug=False, force_wait=False, save_html=False, log_cb=None, progress_cb=None, wait_cb=None, pause_event: asyncio.Event | None = None, api_key: str | None = None):
     """Télécharge un fichier avec callbacks optionnels.
     log_cb(msg) et progress_cb(url, filename, downloaded, total, percent)
+    
+    Si api_key est fournie, tente d'abord le téléchargement premium via API.
+    En cas d'échec, fallback vers le mode gratuit.
     """
     def _log(msg: str):
         if log_cb:
@@ -264,7 +403,21 @@ async def download_file(client, url, outdir=".", debug=False, force_wait=False, 
                 wait_cb(url, remaining, total_wait)
             except Exception:
                 pass
+    
     _log(f"\n🔗 Traitement de {url}")
+    
+    # Tentative premium via API en priorité
+    if api_key and api_key.strip():
+        try:
+            success = await download_via_api(client, url, api_key.strip(), outdir, log_cb, progress_cb)
+            if success:
+                return  # Succès via API, on s'arrête ici
+            else:
+                _log("⚠️ Échec téléchargement premium, passage en mode gratuit...")
+        except Exception as e:
+            _log(f"⚠️ Erreur API premium: {e}, passage en mode gratuit...")
+    
+    # Mode gratuit (code existant)
     r = await fetch_html(client, url)
     soup = BeautifulSoup(r.text, "html.parser")
     save_debug(debug, "initial", r.text)
@@ -404,20 +557,20 @@ async def download_file(client, url, outdir=".", debug=False, force_wait=False, 
                         if dl_regex_hit:
                             direct = dl_regex_hit
                     if not direct:
-                        # Meta refresh
-                        meta = soup2.find("meta", attrs={"http-equiv": re.compile("refresh", re.I)})
-                        if meta:
-                            meta_dict = {}
-                            try:
-                                meta_dict = dict(meta.attrs)  # type: ignore[attr-defined]
-                            except Exception:
-                                meta_dict = {}
-                            content_attr = meta_dict.get("content")
-                            if isinstance(content_attr, str):
-                                parts = content_attr.split(";", 1)
-                                if len(parts) == 2 and "url=" in parts[1].lower():
-                                    dest = parts[1].split("=", 1)[1].strip()
-                                    direct = urljoin(r2.url, dest)
+                        # Meta refresh - find by text inspection
+                        html_text = r2.text
+                        if "meta" in html_text.lower() and "refresh" in html_text.lower():
+                            import re as meta_re
+                            match = meta_re.search(r'content=["\']([^"\']*)["\']', html_text, meta_re.I)
+                            if match:
+                                content = match.group(1)
+                                if "url=" in content.lower():
+                                    parts = content.split(";", 1)
+                                    if len(parts) == 2:
+                                        url_part = parts[1].split("=", 1)
+                                        if len(url_part) == 2:
+                                            dest = url_part[1].strip()
+                                            direct = urljoin(str(r2.url), dest)
                     # Réactualise form avec nouvelle page si encore échec (peut contenir nouveau token hidden)
                     if not direct:
                         new_form = find_download_form(soup2) or soup2.find("form", id="f1")
@@ -468,15 +621,58 @@ async def download_file(client, url, outdir=".", debug=False, force_wait=False, 
         downloaded = existing
         _log(f"⬇️ Téléchargement → {filename} ({total/1024/1024:.2f} MB)" if total else f"⬇️ Téléchargement → {filename}")
 
+        # Variables pour calcul de vitesse
+        start_time = time.time()
+        last_update = start_time
+        last_downloaded = downloaded
+
         with open(part_path, mode) as f:
             async for chunk in resp.aiter_bytes(1024*128):
                 if pause_event and not pause_event.is_set():
                     await pause_event.wait()
                 f.write(chunk)
                 downloaded += len(chunk)
+                
+                # Affichage avec vitesse pour CLI (sans log_cb)
                 if total and not log_cb:
-                    pct = downloaded / total * 100
-                    print(f"\rProgression: {pct:5.1f}% ({downloaded/1024/1024:.2f} / {total/1024/1024:.2f} MB)", end="")
+                    current_time = time.time()
+                    if current_time - last_update > 0.5:  # Mise à jour toutes les 0.5s
+                        elapsed = current_time - start_time
+                        if elapsed > 0:
+                            speed_bps = (downloaded - existing) / elapsed
+                            if speed_bps < 1024:
+                                speed_str = f"{speed_bps:.0f} B/s"
+                            elif speed_bps < 1024*1024:
+                                speed_str = f"{speed_bps/1024:.1f} KB/s"
+                            elif speed_bps < 1024*1024*1024:
+                                speed_str = f"{speed_bps/(1024*1024):.1f} MB/s"
+                            else:
+                                speed_str = f"{speed_bps/(1024*1024*1024):.1f} GB/s"
+                            
+                            # Calcul ETA
+                            if speed_bps > 0:
+                                remaining = total - downloaded
+                                eta_seconds = remaining / speed_bps
+                                if eta_seconds < 60:
+                                    eta_str = f"{eta_seconds:.0f}s"
+                                elif eta_seconds < 3600:
+                                    minutes = int(eta_seconds // 60)
+                                    seconds = int(eta_seconds % 60)
+                                    eta_str = f"{minutes}m{seconds:02d}s"
+                                else:
+                                    hours = int(eta_seconds // 3600)
+                                    minutes = int((eta_seconds % 3600) // 60)
+                                    eta_str = f"{hours}h{minutes:02d}m"
+                            else:
+                                eta_str = "--"
+                            
+                            pct = downloaded / total * 100
+                            print(f"\rProgression: {pct:5.1f}% ({downloaded/1024/1024:.2f} / {total/1024/1024:.2f} MB) - {speed_str} - ETA: {eta_str}", end="")
+                            last_update = current_time
+                        else:
+                            pct = downloaded / total * 100
+                            print(f"\rProgression: {pct:5.1f}% ({downloaded/1024/1024:.2f} / {total/1024/1024:.2f} MB)", end="")
+                
                 _progress(filename, downloaded, total)
         if not log_cb:
             print()
@@ -514,28 +710,152 @@ async def prefetch_display_names(client, urls, log_cb=None):
     await asyncio.gather(*[_wrapped(u) for u in urls])
     return results
 
-def parse_args(argv):
-    urls = []
-    outdir = "."
-    debug = False
-    save_html = False
-    i = 0
-    while i < len(argv):
-        a = argv[i]
-        if a in ("--debug", "-d"):
-            debug = True
-        elif a in ("--output", "-o") and i + 1 < len(argv):
-            outdir = argv[i+1]
-            i += 1
-        elif a == "--save-html":
-            save_html = True
-        elif a.startswith("-"):
-            # unrecognized flag ignored
-            pass
-        else:
-            urls.append(a)
-        i += 1
-    return urls, outdir, debug or bool(os.environ.get("F1_DEBUG")), save_html
+async def test_api_key(api_key: str, test_url: str = "https://1fichier.com/?egbirg99i0xnyikzmqhj"):
+    """Teste une clé API avec une URL de fichier."""
+    print(f"🔑 Test de la clé API...")
+    print(f"🔗 URL de test: {test_url}")
+    print(f"🗝️ Clé API: {api_key[:10]}...{api_key[-4:] if len(api_key) > 14 else api_key}")
+    
+    auth_headers = {
+        'Authorization': f'Bearer {api_key}',
+        'Content-Type': 'application/json'
+    }
+    
+    async with httpx.AsyncClient(headers={"User-Agent":"Mozilla/5.0"}) as client:
+        # Test 1: Récupération des infos du fichier
+        print("\n📋 Test 1: Récupération des informations du fichier...")
+        try:
+            info_resp = await client.post(
+                "https://api.1fichier.com/v1/file/info.cgi",
+                json={'url': test_url},
+                headers=auth_headers,
+                timeout=30
+            )
+            print(f"   Status HTTP: {info_resp.status_code}")
+            
+            if info_resp.status_code == 200:
+                info_data = info_resp.json()
+                print(f"   Réponse API: {info_data}")
+                
+                # Format direct avec filename/size ou format avec status
+                if 'filename' in info_data and 'size' in info_data:
+                    print("   ✅ Informations récupérées avec succès")
+                    filename = info_data.get('filename', 'N/A')
+                    file_size = int(info_data.get('size', 0))
+                    print(f"   📄 Nom: {filename}")
+                    print(f"   📦 Taille: {file_size/1024/1024:.2f} MB")
+                elif info_data.get('status') == 'OK':
+                    print("   ✅ Informations récupérées avec succès")
+                    filename = info_data.get('filename', 'N/A')
+                    file_size = int(info_data.get('size', 0))
+                    print(f"   📄 Nom: {filename}")
+                    print(f"   📦 Taille: {file_size/1024/1024:.2f} MB")
+                else:
+                    error_msg = info_data.get('message', 'Unknown error')
+                    print(f"   ❌ Erreur API: {error_msg}")
+                    if 'authenticated' in error_msg.lower():
+                        print("   💡 Clé API invalide ou compte non premium")
+                    return False
+            else:
+                print(f"   ❌ Erreur HTTP: {info_resp.text}")
+                if info_resp.status_code == 401:
+                    print("   💡 Clé API invalide ou expirée")
+                elif info_resp.status_code == 403:
+                    print("   💡 Accès interdit - vérifiez vos permissions")
+                return False
+                
+        except Exception as e:
+            print(f"   ❌ Erreur lors du test des infos: {e}")
+            return False
+        
+        # Test 2: Obtention du lien de téléchargement
+        print("\n🔗 Test 2: Obtention du lien de téléchargement...")
+        try:
+            dl_resp = await client.post(
+                "https://api.1fichier.com/v1/download/get_token.cgi",
+                json={'url': test_url},
+                headers=auth_headers,
+                timeout=30
+            )
+            print(f"   Status HTTP: {dl_resp.status_code}")
+            
+            if dl_resp.status_code == 200:
+                dl_data = dl_resp.json()
+                print(f"   Réponse API: {dl_data}")
+                
+                # L'API peut retourner directement l'URL ou avec un status
+                if 'url' in dl_data:
+                    download_url = dl_data.get('url')
+                    if download_url:
+                        print("   ✅ Lien de téléchargement obtenu")
+                        print(f"   🔗 URL: {download_url[:50]}...")
+                        return True
+                    else:
+                        print("   ❌ Pas de lien de téléchargement dans la réponse")
+                        return False
+                elif dl_data.get('status') == 'OK':
+                    download_url = dl_data.get('url')
+                    if download_url:
+                        print("   ✅ Lien de téléchargement obtenu")
+                        print(f"   🔗 URL: {download_url[:50]}...")
+                        return True
+                    else:
+                        print("   ❌ Pas de lien de téléchargement dans la réponse")
+                        return False
+                else:
+                    error_msg = dl_data.get('message', 'Unknown error')
+                    print(f"   ❌ Erreur API: {error_msg}")
+                    if 'limit' in error_msg.lower():
+                        print("   💡 Limite de téléchargement premium atteinte")
+                    return False
+            else:
+                print(f"   ❌ Erreur HTTP: {dl_resp.text}")
+                return False
+                
+        except Exception as e:
+            print(f"   ❌ Erreur lors du test du lien: {e}")
+            return False
+
+def print_help():
+    """Affiche l'aide du programme."""
+    print("""
+Usage: python main.py [OPTIONS] [URLs...]
+
+Options:
+  -h, --help          Affiche cette aide
+  -o, --output DIR    Dossier de destination (défaut: .)
+  -d, --debug         Mode debug (sauvegarde des pages HTML)
+  --save-html         Sauvegarde les pages HTML pour diagnostic
+  --api-key KEY       Clé API premium 1fichier pour téléchargement rapide
+  --test-api          Test la clé API sans télécharger
+  --gui               Lance l'interface graphique
+  
+Exemples:
+  # Téléchargement simple en mode gratuit
+  python main.py https://1fichier.com/?abcd1234
+  
+  # Téléchargement premium avec clé API
+  python main.py --api-key YOUR_API_KEY https://1fichier.com/?abcd1234
+  
+  # Test de clé API
+  python main.py --api-key YOUR_API_KEY --test-api
+  
+  # Téléchargement multiple avec dossier de sortie
+  python main.py -o downloads https://1fichier.com/?file1 https://1fichier.com/?file2
+  
+  # Mode debug pour résoudre les problèmes
+  python main.py --debug --save-html https://1fichier.com/?abcd1234
+  
+  # Lancer l'interface graphique
+  python main.py --gui
+
+Notes:
+  - En mode premium (avec --api-key), le téléchargement se fait via l'API
+  - En cas d'échec premium, fallback automatique vers le mode gratuit
+  - L'option --test-api permet de vérifier votre clé API sans télécharger
+  - Sans arguments, le programme demande les URLs interactivement
+  - En binaire (.exe), lance automatiquement l'interface graphique
+""")
 
 async def main(argv=None):
     # Si lancé en binaire PyInstaller (frozen) sans arguments -> ouvrir GUI automatiquement
@@ -544,11 +864,37 @@ async def main(argv=None):
             argv = ['--gui']
         else:
             argv = sys.argv[1:]
+    
     if "--gui" in argv:
         import gui  # type: ignore
         gui.launch_gui()
         return
-    urls, outdir, debug, save_html = parse_args(argv)
+    
+    urls, outdir, debug, save_html, api_key, test_api, help_requested = parse_args(argv)
+    
+    if help_requested:
+        print_help()
+        return
+    
+    # Mode test API
+    if test_api:
+        if not api_key:
+            api_key = input("Entrez votre clé API 1fichier: ").strip()
+        if not api_key:
+            print("❌ Clé API requise pour le test")
+            return
+        
+        test_url = "https://1fichier.com/?egbirg99i0xnyikzmqhj"  # URL par défaut
+        if urls:
+            test_url = urls[0]  # Utiliser la première URL fournie si disponible
+        
+        success = await test_api_key(api_key, test_url)
+        if success:
+            print("\n🎉 Test API réussi ! Votre clé API fonctionne correctement.")
+        else:
+            print("\n❌ Test API échoué. Vérifiez votre clé API et votre statut premium.")
+        return
+    
     force_wait = any(a in ("--force-wait",) for a in argv)
     if not urls:
         urls = input("Entre les URLs 1fichier (séparées par espace ou retour ligne) :\n").split()
@@ -565,7 +911,97 @@ async def main(argv=None):
                 nm = name_map.get(u) or "(nom inconnu)"
                 print(f"{idx:2d}. {nm}")
             print()
-        tasks = [download_file(client, u, outdir=outdir, debug=debug, force_wait=force_wait, save_html=save_html) for u in clean_urls]
+        tasks = [download_file(client, u, outdir=outdir, debug=debug, force_wait=force_wait, save_html=save_html, api_key=api_key) for u in clean_urls]
+        await asyncio.gather(*tasks)
+
+def parse_args(argv):
+    urls = []
+    outdir = "."
+    debug = False
+    save_html = False
+    api_key = None
+    test_api = False
+    help_requested = False
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("--help", "-h"):
+            help_requested = True
+        elif a in ("--debug", "-d"):
+            debug = True
+        elif a in ("--output", "-o") and i + 1 < len(argv):
+            outdir = argv[i+1]
+            i += 1
+        elif a == "--save-html":
+            save_html = True
+        elif a in ("--api-key", "--api") and i + 1 < len(argv):
+            api_key = argv[i+1]
+            i += 1
+        elif a == "--test-api":
+            test_api = True
+        elif a.startswith("-"):
+            # unrecognized flag ignored
+            pass
+        else:
+            urls.append(a)
+        i += 1
+    return urls, outdir, debug or bool(os.environ.get("F1_DEBUG")), save_html, api_key, test_api, help_requested
+
+async def main(argv=None):
+    # Si lancé en binaire PyInstaller (frozen) sans arguments -> ouvrir GUI automatiquement
+    if argv is None:
+        if getattr(sys, 'frozen', False) and len(sys.argv) == 1:
+            argv = ['--gui']
+        else:
+            argv = sys.argv[1:]
+    
+    if "--gui" in argv:
+        import gui  # type: ignore
+        gui.launch_gui()
+        return
+    
+    urls, outdir, debug, save_html, api_key, test_api, help_requested = parse_args(argv)
+    
+    if help_requested:
+        print_help()
+        return
+    
+    # Mode test API
+    if test_api:
+        if not api_key:
+            api_key = input("Entrez votre clé API 1fichier: ").strip()
+        if not api_key:
+            print("❌ Clé API requise pour le test")
+            return
+        
+        test_url = "https://1fichier.com/?egbirg99i0xnyikzmqhj"  # URL par défaut
+        if urls:
+            test_url = urls[0]  # Utiliser la première URL fournie si disponible
+        
+        success = await test_api_key(api_key, test_url)
+        if success:
+            print("\n🎉 Test API réussi ! Votre clé API fonctionne correctement.")
+        else:
+            print("\n❌ Test API échoué. Vérifiez votre clé API et votre statut premium.")
+        return
+    
+    force_wait = any(a in ("--force-wait",) for a in argv)
+    if not urls:
+        urls = input("Entre les URLs 1fichier (séparées par espace ou retour ligne) :\n").split()
+    if outdir and not os.path.isdir(outdir):
+        os.makedirs(outdir, exist_ok=True)
+    async with httpx.AsyncClient(headers={"User-Agent":"Mozilla/5.0"}) as client:
+        # Pré-récupération des noms si plusieurs URLs
+        clean_urls = [u.strip() for u in urls if u.strip()]
+        if len(clean_urls) > 1:
+            print("🔍 Pré-récupération des noms...")
+            name_map = await prefetch_display_names(client, clean_urls, log_cb=lambda m: print(m))
+            print("— Récapitulatif —")
+            for idx, u in enumerate(clean_urls, 1):
+                nm = name_map.get(u) or "(nom inconnu)"
+                print(f"{idx:2d}. {nm}")
+            print()
+        tasks = [download_file(client, u, outdir=outdir, debug=debug, force_wait=force_wait, save_html=save_html, api_key=api_key) for u in clean_urls]
         await asyncio.gather(*tasks)
 
 if __name__ == "__main__":
